@@ -1,77 +1,56 @@
-// api-server/index.js
-const express  = require('express');
-const jwt      = require('jsonwebtoken');
-const cookie   = require('cookie-parser');
-const body     = require('body-parser');
-const cors     = require('cors');
-const path     = require('path');
+require('dotenv').config()
+const express = require('express')
+const cors = require('cors')
+const body = require('body-parser')
+const passport = require('passport')
+const { BearerStrategy } = require('passport-azure-ad')
 
-const SECRET = 'replace-me';
-const app    = express();
-
-app.use(cors({ origin: 'http://127.0.0.1:5173', credentials: true }));
-app.use(body.json());
-app.use(cookie());
-
-/* ---------- NTLM / Kerberos (optional) --------------------------- */
-let NodeSSPI;
-if (process.platform === 'win32') {
-    try { NodeSSPI = require('node-sspi'); } catch {/* noop */ }
-}
-if (NodeSSPI) {
-    app.use((req, res, next) => {
-        if (!/^Negotiate|NTLM/i.test(req.headers.authorization || '')) return next();
-        new NodeSSPI().authenticate(req, res, err => {
-            if (err) return next(err);
-            if (req.connection.user) req.identity = req.connection.user; // "CORP\\John"
-            next();
-        });
-    });
+const { TENANT_ID, API_APP_ID } = process.env
+if (!TENANT_ID || !API_APP_ID) {
+  console.error('TENANT_ID or API_APP_ID missing in .env')
+  process.exit(1)
 }
 
-/* ---------- silent cookie --------------------------------------- */
-app.get('/auth/silent', (req, res) => {
-    const sid = req.cookies.sid;
-    if (!sid) return res.sendStatus(401);
-    try {
-        const { sub } = jwt.verify(sid, SECRET);
-        return res.json({ token: sid, user: sub });
-    } catch { return res.sendStatus(401); }
-});
+passport.use(
+  new BearerStrategy(
+    {
+      identityMetadata: `https://login.microsoftonline.com/${TENANT_ID}/v2.0/.well-known/openid-configuration`,
+      clientID: API_APP_ID,
+      validateIssuer: true,
+      allowMultiAudiencesInToken: true,
+      loggingLevel: 'warn'
+    },
+    (token, done) => done(null, token)
+  )
+)
 
-/* ---------- interactive login (mock) ---------------------------- */
-app.post('/auth/login', (req, res) => {
-    const { email, password } = req.body;
-    if (email === 'demo@example.com' && password === 'pass') {
-        const token = jwt.sign({ sub: 'testUser' }, SECRET, { expiresIn: '1h' });
-        res.cookie('sid', token, { httpOnly: true, sameSite: 'lax' });
-        return res.json({ token });
+function bearerAuth(req, res, next) {
+  passport.authenticate('oauth-bearer', { session: false, failWithError: true }, (err, user, info) => {
+    if (err) {
+      console.warn('[Auth] error:', err.message)
+      return next(err)
     }
-    res.sendStatus(401);
-});
-
-/* ---------- guard ----------------------------------------------- */
-function ensureAuth(req, res, next) {
-    if (req.identity) return next();                            // NTLM
-
-    const m = (req.headers.authorization || '').match(/^Bearer (.+)$/);
-    if (m) {
-        try { req.identity = jwt.verify(m[1], SECRET).sub; return next(); }
-        catch {/* fall through */}
+    if (!user) {
+      console.warn('[Auth] failed:', info?.message || 'no info')
+      return res.status(401).send(info?.message || 'Unauthorized')
     }
-
-    res.status(401)
-        .set('WWW-Authenticate', NodeSSPI ? 'Negotiate' : '')
-        .json({ interactive: '/static/login.html' });
+    const id = user.preferred_username || user.upn || user.sub
+    console.log('[Auth] OK for', id)
+    req.user = user
+    next()
+  })(req, res, next)
 }
 
-/* ---------- protected user endpoint ----------------------------- */
-app.get('/api/user', ensureAuth, (req, res) => {
-    res.json({ user: req.identity });          // "CORP\\John" | "testUser"
-});
+/* ——— API ——— */
+const app = express()
+app.use(cors({ origin: 'http://127.0.0.1:5173', credentials: true }))
+app.use(body.json())
 
-/* ---------- static login page ----------------------------------- */
-app.use('/static', express.static(path.join(__dirname, 'static')));
+app.get('/api/user', bearerAuth, (req, res) => {
+  const id = req.user.preferred_username || req.user.upn || req.user.sub
+  console.log('[API] /api/user → 200 for', id)
+  res.json({ user: id })
+})
 
-app.listen(3001, () =>
-    console.log(`API listening on http://127.0.0.1:3001  (${process.platform})`));
+/* ——— start ——— */
+app.listen(3001, () => console.log(`API listening on http://127.0.0.1:3001 (${process.platform})`))
